@@ -2,87 +2,89 @@
 
 namespace App\Commands;
 
-use Illuminate\Console\Scheduling\Schedule;
-use LaravelZero\Framework\Commands\Command;
+use App\Services\AIReviewService;
+use App\Services\GitService;
 use Illuminate\Support\Facades\File;
+use LaravelZero\Framework\Commands\Command;
 use OpenAI;
-use Symfony\Component\Process\Process;
+use Exception;
 
+/**
+ * Class ReviewCommand
+ *
+ * Orchestrates the AI-powered code review process. This command fetches 
+ * staged git changes, communicates with the Groq AI service via the 
+ * AIReviewService, and outputs architectural and quality feedback.
+ *
+ * @package App\Commands
+ */
 class ReviewCommand extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
     protected $signature = 'review';
-
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
     protected $description = 'Review staged git changes using AI';
 
     /**
      * Execute the console command.
+     *
+     * This method acts as the controller for the review process:
+     * 1. Resolves dependencies and configuration.
+     * 2. Retrieves the current git diff from the GitService.
+     * 3. Sends the diff to the AIReviewService for analysis.
+     * 4. Renders the AI's response to the terminal.
+     *
+     * @param GitService $gitService Injected service to handle version control operations.
+     * @return void
      */
-    public function handle()
+    public function handle(GitService $gitService)
     {
-        $configPath = $_SERVER['HOME'] . '/.ai-review/config.json';
-        if (!File::exists($configPath)) {
-            $this->error('No API Key found. Please run: cgm-ai-review config');
-            return;
-        }
-
-        $config = json_decode(File::get($configPath), true);
-        // $client = OpenAI::client($config['api_key']);
-        $client = OpenAI::factory()
-                        ->withApiKey($config['api_key'])
-                        ->withBaseUri('https://api.groq.com/openai/v1')
-                        ->make();
-
-        $this->info('🔍 Fetching staged changes...');
-        $process = new Process(['git', 'diff', '--cached']);
-        $process->run();
-
-        if (!$process->isSuccessful()) {
-            $this->error('Git diff failed. Are you in a git repository?');
-            return;
-        }
-
-        $diff = $process->getOutput();
-
-        if (empty($diff)) {
-            $this->warn('No staged changes found. Use "git add" first.');
-            return;
-        }
-
-        $this->info('🤖 AI is reviewing your code...');
-        
         try {
-            $result = $client->chat()->create([
-                'model' => 'llama-3.3-70b-versatile',
-                'messages' => [
-                    ['role' => 'system', 'content' => 'You are a senior developer. Review the git diff for bugs, security risks, and performance. Be concise.'],
-                    ['role' => 'user', 'content' => "Review this git diff:\n\n" . $diff],
-                ],
-            ]);
+            $aiService = $this->resolveAiService();
+
+            $this->info('🔍 Fetching staged changes...');
+            $diff = $gitService->getStagedDiff();
+
+            if (empty($diff)) {
+                $this->warn('No staged changes found. Use "git add" first.');
+                return;
+            }
+
+            $this->info('🤖 AI is reviewing your code...');
+            $review = $aiService->getReview($diff);
 
             $this->line("\n--- AI REVIEW RESULTS ---\n");
-            $this->info($result->choices[0]->message->content);
+            $this->info($review);
             $this->line("\n-------------------------\n");
 
-        } catch (\Exception $e) {
-            $this->error('AI Request failed: ' . $e->getMessage());
+        } catch (Exception $e) {
+            $this->error('Error: ' . $e->getMessage());
         }
     }
 
     /**
-     * Define the command's schedule.
+     * Resolves and initializes the AI Service with the user's local configuration.
+     *
+     * Loads the API credentials from the ~/.ai-review/config.json file,
+     * instantiates the OpenAI factory with the Groq base URI, and 
+     * returns a configured instance of AIReviewService.
+     *
+     * @throws Exception If the configuration file is missing or invalid.
+     * @return AIReviewService
      */
-    public function schedule(Schedule $schedule): void
+    private function resolveAiService(): AIReviewService
     {
-        // $schedule->command(static::class)->everyMinute();
+        $configPath = $_SERVER['HOME'] . '/.ai-review/config.json';
+        
+        if (!File::exists($configPath)) {
+            throw new Exception('No API Key found. Please run: cgm-ai-review config');
+        }
+
+        $config = json_decode(File::get($configPath), true);
+
+        $client = OpenAI::factory()
+            ->withApiKey($config['api_key'])
+            ->withBaseUri('https://api.groq.com/openai/v1')
+            ->make();
+
+        return new AIReviewService($client);
     }
 }
